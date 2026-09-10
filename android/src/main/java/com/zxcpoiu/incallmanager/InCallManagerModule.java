@@ -61,6 +61,8 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 import java.lang.Runnable;
 import java.io.File;
 import java.util.Collections;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -98,9 +100,11 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
     private BroadcastReceiver wiredHeadsetReceiver;
     private BroadcastReceiver noisyAudioReceiver;
     private BroadcastReceiver mediaButtonReceiver;
-    private AudioFocusRequest mCallAudioFocusRequest;
-    private AudioFocusRequest mRingtoneAudioFocusRequest;
     private AudioFocusRequest mActiveAudioFocusRequest;
+    private AudioManager.OnAudioFocusChangeListener mActiveAudioFocusListener;
+    private long nextAudioFocusRequestGeneration;
+    private long activeAudioFocusRequestGeneration = -1L;
+    private final List<AudioFocusRegistration> retiredAudioFocusRegistrations = new ArrayList<>();
 
     // --- same as: RingtoneManager.getActualDefaultRingtoneUri(reactContext, RingtoneManager.TYPE_RINGTONE);
     private Uri defaultRingtoneUri = Settings.System.DEFAULT_RINGTONE_URI;
@@ -179,6 +183,20 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         public boolean isPlaying();
         public boolean startPlay(Map<String, Object> data);
         public void stopPlay();
+    }
+
+    private static final class AudioFocusRegistration {
+        final long generation;
+        final AudioManager.OnAudioFocusChangeListener listener;
+        final AudioFocusRequest request;
+
+        AudioFocusRegistration(long generation,
+                               AudioManager.OnAudioFocusChangeListener listener,
+                               @Nullable AudioFocusRequest request) {
+            this.generation = generation;
+            this.listener = listener;
+            this.request = request;
+        }
     }
 
     @Override
@@ -464,6 +482,16 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         runOnLifecycleThread(() -> handleAudioFocusChange(focusChange));
     }
 
+    private void onAudioFocusChange(long generation, int focusChange) {
+        runOnLifecycleThread(() -> {
+            if (generation != activeAudioFocusRequestGeneration) {
+                Log.d(TAG, "Ignoring stale audio focus callback for generation " + generation);
+                return;
+            }
+            handleAudioFocusChange(focusChange);
+        });
+    }
+
     private void handleAudioFocusChange(int focusChange) {
         audioLifecycleState.onFocusChange(focusChange);
         String focusChangeStr;
@@ -693,78 +721,117 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     private String requestAudioFocus(AudioLifecycleState.FocusUsage usage) {
         boolean ringtone = usage == AudioLifecycleState.FocusUsage.RINGTONE;
-        String result = (Build.VERSION.SDK_INT >= 26)
-                ? requestAudioFocusV26(ringtone)
-                : requestAudioFocusOld(ringtone);
-        if ("AUDIOFOCUS_REQUEST_GRANTED".equals(result)) {
+        final long generation = ++nextAudioFocusRequestGeneration;
+        AudioManager.OnAudioFocusChangeListener listener =
+                focusChange -> onAudioFocusChange(generation, focusChange);
+        AudioFocusRegistration candidate = null;
+        int requestResult;
+        try {
+            AudioFocusRequest request = Build.VERSION.SDK_INT >= 26
+                    ? createAudioFocusRequest(ringtone, listener) : null;
+            candidate = new AudioFocusRegistration(generation, listener, request);
+            requestResult = Build.VERSION.SDK_INT >= 26
+                    ? audioManager.requestAudioFocus(request)
+                    : audioManager.requestAudioFocus(
+                            listener,
+                            ringtone ? AudioManager.STREAM_RING : AudioManager.STREAM_VOICE_CALL,
+                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "requestAudioFocus() failed for generation " + generation, e);
+            audioLifecycleState.onFocusRequestFailed();
+            retireIfCleanupFails(candidate);
+            return "AUDIOFOCUS_REQUEST_FAILED";
+        }
+
+        String result = audioFocusResultToString(requestResult);
+        if (requestResult == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            AudioFocusRegistration previous = getActiveAudioFocusRegistration();
+            // Activate the new identity before retiring the old one so a
+            // synchronous old-listener callback cannot mutate the new state.
+            setActiveAudioFocusRegistration(candidate);
             audioLifecycleState.onFocusRequestGranted(usage);
+            retireIfCleanupFails(previous);
         } else {
             audioLifecycleState.onFocusRequestFailed();
+            retireIfCleanupFails(candidate);
         }
         Log.d(TAG, "requestAudioFocus(): usage=" + usage + ", res=" + result);
         return result;
     }
 
-    private String requestAudioFocusV26(boolean ringtone) {
-        AudioFocusRequest request = ringtone ? mRingtoneAudioFocusRequest : mCallAudioFocusRequest;
-        if (request == null) {
-            AudioAttributes attributes = new AudioAttributes.Builder()
-                    .setUsage(ringtone ? AudioAttributes.USAGE_NOTIFICATION_RINGTONE : AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(ringtone ? AudioAttributes.CONTENT_TYPE_SONIFICATION : AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build();
-            request = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                    .setAudioAttributes(attributes)
-                    .setAcceptsDelayedFocusGain(false)
-                    .setWillPauseWhenDucked(false)
-                    .setOnAudioFocusChangeListener(this, ringtoneHandler)
-                    .build();
-            if (ringtone) {
-                mRingtoneAudioFocusRequest = request;
-            } else {
-                mCallAudioFocusRequest = request;
-            }
-        }
-
-        int requestAudioFocusRes = audioManager.requestAudioFocus(request);
-
-        String requestAudioFocusResStr;
-        switch (requestAudioFocusRes) {
-            case AudioManager.AUDIOFOCUS_REQUEST_FAILED:
-                requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
-                break;
-            case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                mActiveAudioFocusRequest = request;
-                requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
-                break;
-            case AudioManager.AUDIOFOCUS_REQUEST_DELAYED:
-                requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_DELAYED";
-                break;
-            default:
-                requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_UNKNOWN";
-                break;
-        }
-
-        return requestAudioFocusResStr;
+    private AudioFocusRequest createAudioFocusRequest(
+            boolean ringtone,
+            AudioManager.OnAudioFocusChangeListener listener) {
+        AudioAttributes attributes = new AudioAttributes.Builder()
+                .setUsage(ringtone
+                        ? AudioAttributes.USAGE_NOTIFICATION_RINGTONE
+                        : AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(ringtone
+                        ? AudioAttributes.CONTENT_TYPE_SONIFICATION
+                        : AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+        return new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(attributes)
+                .setAcceptsDelayedFocusGain(false)
+                .setWillPauseWhenDucked(false)
+                .setOnAudioFocusChangeListener(listener, ringtoneHandler)
+                .build();
     }
 
-    private String requestAudioFocusOld(boolean ringtone) {
-        int stream = ringtone ? AudioManager.STREAM_RING : AudioManager.STREAM_VOICE_CALL;
-        int requestAudioFocusRes = audioManager.requestAudioFocus(this, stream, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
-
-        String requestAudioFocusResStr;
-        switch (requestAudioFocusRes) {
+    private String audioFocusResultToString(int result) {
+        switch (result) {
             case AudioManager.AUDIOFOCUS_REQUEST_FAILED:
-                requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
-                break;
+                return "AUDIOFOCUS_REQUEST_FAILED";
             case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
-                break;
+                return "AUDIOFOCUS_REQUEST_GRANTED";
+            case AudioManager.AUDIOFOCUS_REQUEST_DELAYED:
+                return "AUDIOFOCUS_REQUEST_DELAYED";
             default:
-                requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_UNKNOWN";
-                break;
+                return "AUDIOFOCUS_REQUEST_UNKNOWN";
         }
+    }
 
-        return requestAudioFocusResStr;
+    @Nullable
+    private AudioFocusRegistration getActiveAudioFocusRegistration() {
+        if (mActiveAudioFocusListener == null) {
+            return null;
+        }
+        return new AudioFocusRegistration(
+                activeAudioFocusRequestGeneration,
+                mActiveAudioFocusListener,
+                mActiveAudioFocusRequest);
+    }
+
+    private void setActiveAudioFocusRegistration(AudioFocusRegistration registration) {
+        activeAudioFocusRequestGeneration = registration.generation;
+        mActiveAudioFocusListener = registration.listener;
+        mActiveAudioFocusRequest = registration.request;
+    }
+
+    private void clearActiveAudioFocusRegistration() {
+        activeAudioFocusRequestGeneration = -1L;
+        mActiveAudioFocusListener = null;
+        mActiveAudioFocusRequest = null;
+    }
+
+    private int abandonAudioFocusRegistration(AudioFocusRegistration registration) {
+        try {
+            if (Build.VERSION.SDK_INT >= 26 && registration.request != null) {
+                return audioManager.abandonAudioFocusRequest(registration.request);
+            }
+            return audioManager.abandonAudioFocus(registration.listener);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Failed to abandon audio focus generation " + registration.generation, e);
+            return AudioManager.AUDIOFOCUS_REQUEST_FAILED;
+        }
+    }
+
+    private void retireIfCleanupFails(@Nullable AudioFocusRegistration registration) {
+        if (registration == null
+                || abandonAudioFocusRegistration(registration) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            return;
+        }
+        retireAudioFocusRegistration(registration);
     }
 
     @ReactMethod
@@ -778,64 +845,65 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
     private void releaseAudioFocus(AudioLifecycleState.FocusOwner owner) {
         if (audioLifecycleState.releaseFocusOwner(owner)) {
             abandonAudioFocus();
+        } else {
+            retryRetiredAudioFocusCleanup();
         }
     }
 
     private void releaseRingtoneAudioFocus(long generation) {
         if (audioLifecycleState.releaseRingtoneFocusOwner(generation)) {
             abandonAudioFocus();
+        } else {
+            retryRetiredAudioFocusCleanup();
         }
+    }
+
+    private boolean retryRetiredAudioFocusCleanup() {
+        List<AudioFocusRegistration> stillRetired = new ArrayList<>();
+        for (AudioFocusRegistration retired : retiredAudioFocusRegistrations) {
+            if (abandonAudioFocusRegistration(retired) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                stillRetired.add(retired);
+            }
+        }
+        retiredAudioFocusRegistrations.clear();
+        retiredAudioFocusRegistrations.addAll(stillRetired);
+        return stillRetired.isEmpty();
     }
 
     private String abandonAudioFocus() {
-        String abandonAudioFocusResStr = (Build.VERSION.SDK_INT >= 26)
-                ? abandonAudioFocusV26()
-                : abandonAudioFocusOld();
-        Log.d(TAG, "abandonAudioFocus(): res = " + abandonAudioFocusResStr);
-        return abandonAudioFocusResStr;
+        AudioFocusRegistration active = getActiveAudioFocusRegistration();
+        clearActiveAudioFocusRegistration();
+
+        // Retired registrations must be removed before the active one. This
+        // prevents an older focus request from being promoted during cleanup.
+        boolean retiredCleanupSucceeded = retryRetiredAudioFocusCleanup();
+
+        if (active == null) {
+            String resultString = retiredCleanupSucceeded
+                    ? "" : "AUDIOFOCUS_REQUEST_FAILED";
+            Log.d(TAG, "abandonAudioFocus(): res = " + resultString);
+            return resultString;
+        }
+
+        int result = abandonAudioFocusRegistration(active);
+        if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            retireAudioFocusRegistration(active);
+        }
+        if (!retiredCleanupSucceeded) {
+            result = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
+        }
+        String resultString = audioFocusResultToString(result);
+        Log.d(TAG, "abandonAudioFocus(): res = " + resultString);
+        return resultString;
     }
 
-    private String abandonAudioFocusV26() {
-        AudioFocusRequest request = mActiveAudioFocusRequest;
-        if (request == null) {
-            return "";
+    private void retireAudioFocusRegistration(AudioFocusRegistration registration) {
+        for (AudioFocusRegistration retired : retiredAudioFocusRegistrations) {
+            if (retired.generation == registration.generation) {
+                return;
+            }
         }
-
-        int abandonAudioFocusRes = audioManager.abandonAudioFocusRequest(request);
-        String abandonAudioFocusResStr;
-        switch (abandonAudioFocusRes) {
-            case AudioManager.AUDIOFOCUS_REQUEST_FAILED:
-                abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
-                break;
-            case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
-                break;
-            default:
-                abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_UNKNOWN";
-                break;
-        }
-
-        mActiveAudioFocusRequest = null;
-        return abandonAudioFocusResStr;
-    }
-
-    private String abandonAudioFocusOld() {
-        int abandonAudioFocusRes = audioManager.abandonAudioFocus(this);
-
-        String abandonAudioFocusResStr;
-        switch (abandonAudioFocusRes) {
-            case AudioManager.AUDIOFOCUS_REQUEST_FAILED:
-                abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
-                break;
-            case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
-                break;
-            default:
-                abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_UNKNOWN";
-                break;
-        }
-
-        return abandonAudioFocusResStr;
+        retiredAudioFocusRegistrations.add(registration);
     }
 
     @ReactMethod
