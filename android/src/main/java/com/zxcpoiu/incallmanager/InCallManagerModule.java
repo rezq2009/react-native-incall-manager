@@ -33,6 +33,9 @@ import android.os.PowerManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
 import android.provider.Settings;
 import androidx.annotation.Nullable;
 import android.util.Log;
@@ -50,6 +53,7 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.UiThreadUtil;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
@@ -79,9 +83,7 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
     // --- AudioRouteManager
     private AudioManager audioManager;
     private volatile boolean audioManagerActivated = false;
-    private final Object audioSetupLock = new Object();
-    private boolean isAudioFocused = false;
-    //private final Object mAudioFocusLock = new Object();
+    private final AudioLifecycleState audioLifecycleState = new AudioLifecycleState();
     private boolean isOrigAudioSetupStored = false;
     private boolean origIsSpeakerPhoneOn = false;
     private boolean origIsMicrophoneMute = false;
@@ -96,8 +98,9 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
     private BroadcastReceiver wiredHeadsetReceiver;
     private BroadcastReceiver noisyAudioReceiver;
     private BroadcastReceiver mediaButtonReceiver;
-    private AudioAttributes mAudioAttributes;
-    private AudioFocusRequest mAudioFocusRequest;
+    private AudioFocusRequest mCallAudioFocusRequest;
+    private AudioFocusRequest mRingtoneAudioFocusRequest;
+    private AudioFocusRequest mActiveAudioFocusRequest;
 
     // --- same as: RingtoneManager.getActualDefaultRingtoneUri(reactContext, RingtoneManager.TYPE_RINGTONE);
     private Uri defaultRingtoneUri = Settings.System.DEFAULT_RINGTONE_URI;
@@ -111,7 +114,12 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
     private MyPlayerInterface mRingtone;
     private MyPlayerInterface mRingback;
     private MyPlayerInterface mBusytone;
-    private Handler mRingtoneCountDownHandler;
+    private final Handler ringtoneHandler = new Handler(Looper.getMainLooper());
+    private Runnable ringtoneTimeout;
+    private long ringtoneTimeoutGeneration = -1L;
+    private Vibrator ringtoneVibrator;
+    private long ringtoneVibratorGeneration = -1L;
+    private long ringtonePlayerGeneration = -1L;
     private String media = "audio";
 
     private static final String SPEAKERPHONE_AUTO = "auto";
@@ -169,7 +177,7 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     interface MyPlayerInterface {
         public boolean isPlaying();
-        public void startPlay(Map<String, Object> data);
+        public boolean startPlay(Map<String, Object> data);
         public void stopPlay();
     }
 
@@ -410,6 +418,10 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void startProximitySensor() {
+        runOnLifecycleThread(this::startProximitySensorOnLifecycleThread);
+    }
+
+    private void startProximitySensorOnLifecycleThread() {
         if (!proximityManager.isProximitySupported()) {
             Log.d(TAG, "Proximity Sensor is not supported.");
             return;
@@ -429,6 +441,10 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void stopProximitySensor() {
+        runOnLifecycleThread(this::stopProximitySensorOnLifecycleThread);
+    }
+
+    private void stopProximitySensorOnLifecycleThread() {
         if (!proximityManager.isProximitySupported()) {
             Log.d(TAG, "Proximity Sensor is not supported.");
             return;
@@ -444,7 +460,12 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     // --- see: https://developer.android.com/reference/android/media/AudioManager
     @Override
-    public void onAudioFocusChange(int focusChange) {
+    public void onAudioFocusChange(final int focusChange) {
+        runOnLifecycleThread(() -> handleAudioFocusChange(focusChange));
+    }
+
+    private void handleAudioFocusChange(int focusChange) {
+        audioLifecycleState.onFocusChange(focusChange);
         String focusChangeStr;
         switch (focusChange) {
             case AudioManager.AUDIOFOCUS_GAIN:
@@ -540,30 +561,43 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         }
     }
 
+    private void runOnLifecycleThread(Runnable action) {
+        if (Looper.myLooper() == ringtoneHandler.getLooper()) {
+            action.run();
+        } else {
+            ringtoneHandler.post(action);
+        }
+    }
+
     @ReactMethod
     public void start(final String _media, final boolean auto, final String ringbackUriType) {
-        media = _media;
+        runOnLifecycleThread(() -> startOnLifecycleThread(_media, auto, ringbackUriType));
+    }
+
+    private void startOnLifecycleThread(String requestedMedia, boolean auto, String ringbackUriType) {
+        media = requestedMedia;
         if (media.equals("video")) {
             defaultSpeakerOn = true;
         } else {
             defaultSpeakerOn = false;
         }
         automatic = auto;
+        // A new explicit start supersedes a deferred stop that is still playing
+        // its busy tone. Clearing the identity also makes its late completion stale.
+        stopBusytoneOnLifecycleThread();
         if (!audioManagerActivated) {
-            synchronized (audioSetupLock) {
-                audioManagerActivated = true;
-            }
+            audioManagerActivated = true;
+            audioLifecycleState.startCall();
+            storeOriginalAudioSetup();
 
             Log.d(TAG, "start audioRouteManager");
-            wakeLockUtils.acquirePartialWakeLock();
-            if (mRingtone != null && mRingtone.isPlaying()) {
-                Log.d(TAG, "stop ringtone");
-                stopRingtone(); // --- use brandnew instance
-            }
-            storeOriginalAudioSetup();
-            requestAudioFocus();
+            updatePartialWakeLock();
+            // Request call focus before invalidating an incoming-ring session so
+            // answering does not introduce a focus gap.
+            requestFocusForCurrentOwners();
+            stopRingtoneOnLifecycleThread(audioLifecycleState.currentRingtoneGeneration());
             startEvents();
-            UiThreadUtil.runOnUiThread(() -> {
+            runOnLifecycleThread(() -> {
                 bluetoothManager.start();
             });
             // TODO: even if not acquired focus, we can still play sounds. but need figure out which is better.
@@ -580,8 +614,12 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
             updateAudioRoute();
 
             if (!ringbackUriType.isEmpty()) {
-                startRingback(ringbackUriType);
+                startRingbackOnLifecycleThread(ringbackUriType);
             }
+        } else {
+            // An explicit repeated start is also a focus repair point after a
+            // transient or permanent loss. Routing setup remains idempotent.
+            requestFocusForCurrentOwners();
         }
     }
 
@@ -591,29 +629,32 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void stop(final String busytoneUriType) {
+        runOnLifecycleThread(() -> stopOnLifecycleThread(busytoneUriType));
+    }
+
+    private void stopOnLifecycleThread(String busytoneUriType) {
         if (audioManagerActivated) {
-            stopRingback();
-            if (!busytoneUriType.isEmpty() && startBusytone(busytoneUriType)) {
+            stopRingbackOnLifecycleThread();
+            if (!busytoneUriType.isEmpty() && startBusytoneOnLifecycleThread(busytoneUriType)) {
                 // play busytone first, and call this func again when finish
                 Log.d(TAG, "play busytone before stop InCallManager");
                 return;
             } else {
                 Log.d(TAG, "stop() InCallManager");
-                stopBusytone();
+                stopBusytoneOnLifecycleThread();
                 stopEvents();
                 setSpeakerphoneOn(false);
                 setMicrophoneMute(false);
                 forceSpeakerOn = 0;
-                UiThreadUtil.runOnUiThread(() -> {
+                runOnLifecycleThread(() -> {
                     bluetoothManager.stop();
                 });
-                synchronized (audioSetupLock) {
-                    restoreOriginalAudioSetup();
-                    audioManagerActivated = false;
-                }
-                abandonAudioFocus();
+                restoreOriginalAudioSetup();
+                audioManagerActivated = false;
+                audioLifecycleState.stopCall();
+                releaseAudioFocus(AudioLifecycleState.FocusOwner.CALL);
             }
-            wakeLockUtils.releasePartialWakeLock();
+            updatePartialWakeLock();
         }
     }
 
@@ -636,39 +677,55 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void requestAudioFocusJS(Promise promise) {
-        promise.resolve(requestAudioFocus());
+        runOnLifecycleThread(() -> {
+            String result = requestAudioFocus(AudioLifecycleState.FocusUsage.CALL);
+            if ("AUDIOFOCUS_REQUEST_GRANTED".equals(result)) {
+                audioLifecycleState.addManualFocusOwner();
+            }
+            promise.resolve(result);
+        });
     }
 
-    private String requestAudioFocus() {
-        String requestAudioFocusResStr = (android.os.Build.VERSION.SDK_INT >= 26)
-                ? requestAudioFocusV26()
-                : requestAudioFocusOld();
-        Log.d(TAG, "requestAudioFocus(): res = " + requestAudioFocusResStr);
-        return requestAudioFocusResStr;
+    private String requestFocusForCurrentOwners() {
+        AudioLifecycleState.FocusUsage usage = audioLifecycleState.effectiveFocusUsage();
+        return usage == null ? "" : requestAudioFocus(usage);
     }
 
-    private String requestAudioFocusV26() {
-        if (isAudioFocused) {
-            return "";
+    private String requestAudioFocus(AudioLifecycleState.FocusUsage usage) {
+        boolean ringtone = usage == AudioLifecycleState.FocusUsage.RINGTONE;
+        String result = (Build.VERSION.SDK_INT >= 26)
+                ? requestAudioFocusV26(ringtone)
+                : requestAudioFocusOld(ringtone);
+        if ("AUDIOFOCUS_REQUEST_GRANTED".equals(result)) {
+            audioLifecycleState.onFocusRequestGranted(usage);
+        } else {
+            audioLifecycleState.onFocusRequestFailed();
         }
+        Log.d(TAG, "requestAudioFocus(): usage=" + usage + ", res=" + result);
+        return result;
+    }
 
-        if (mAudioAttributes == null) {
-            mAudioAttributes = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+    private String requestAudioFocusV26(boolean ringtone) {
+        AudioFocusRequest request = ringtone ? mRingtoneAudioFocusRequest : mCallAudioFocusRequest;
+        if (request == null) {
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                    .setUsage(ringtone ? AudioAttributes.USAGE_NOTIFICATION_RINGTONE : AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(ringtone ? AudioAttributes.CONTENT_TYPE_SONIFICATION : AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
-        }
-
-        if (mAudioFocusRequest == null) {
-            mAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                    .setAudioAttributes(mAudioAttributes)
+            request = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(attributes)
                     .setAcceptsDelayedFocusGain(false)
                     .setWillPauseWhenDucked(false)
-                    .setOnAudioFocusChangeListener(this)
+                    .setOnAudioFocusChangeListener(this, ringtoneHandler)
                     .build();
+            if (ringtone) {
+                mRingtoneAudioFocusRequest = request;
+            } else {
+                mCallAudioFocusRequest = request;
+            }
         }
 
-        int requestAudioFocusRes = audioManager.requestAudioFocus(mAudioFocusRequest);
+        int requestAudioFocusRes = audioManager.requestAudioFocus(request);
 
         String requestAudioFocusResStr;
         switch (requestAudioFocusRes) {
@@ -676,7 +733,7 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
                 requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
                 break;
             case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                isAudioFocused = true;
+                mActiveAudioFocusRequest = request;
                 requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
                 break;
             case AudioManager.AUDIOFOCUS_REQUEST_DELAYED:
@@ -690,12 +747,9 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         return requestAudioFocusResStr;
     }
 
-    private String requestAudioFocusOld() {
-        if (isAudioFocused) {
-            return "";
-        }
-
-        int requestAudioFocusRes = audioManager.requestAudioFocus(this, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+    private String requestAudioFocusOld(boolean ringtone) {
+        int stream = ringtone ? AudioManager.STREAM_RING : AudioManager.STREAM_VOICE_CALL;
+        int requestAudioFocusRes = audioManager.requestAudioFocus(this, stream, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
 
         String requestAudioFocusResStr;
         switch (requestAudioFocusRes) {
@@ -703,7 +757,6 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
                 requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
                 break;
             case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                isAudioFocused = true;
                 requestAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
                 break;
             default:
@@ -716,11 +769,26 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void abandonAudioFocusJS(Promise promise) {
-        promise.resolve(abandonAudioFocus());
+        runOnLifecycleThread(() -> {
+            audioLifecycleState.explicitAbandon();
+            promise.resolve(abandonAudioFocus());
+        });
+    }
+
+    private void releaseAudioFocus(AudioLifecycleState.FocusOwner owner) {
+        if (audioLifecycleState.releaseFocusOwner(owner)) {
+            abandonAudioFocus();
+        }
+    }
+
+    private void releaseRingtoneAudioFocus(long generation) {
+        if (audioLifecycleState.releaseRingtoneFocusOwner(generation)) {
+            abandonAudioFocus();
+        }
     }
 
     private String abandonAudioFocus() {
-        String abandonAudioFocusResStr = (android.os.Build.VERSION.SDK_INT >= 26)
+        String abandonAudioFocusResStr = (Build.VERSION.SDK_INT >= 26)
                 ? abandonAudioFocusV26()
                 : abandonAudioFocusOld();
         Log.d(TAG, "abandonAudioFocus(): res = " + abandonAudioFocusResStr);
@@ -728,18 +796,18 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
     }
 
     private String abandonAudioFocusV26() {
-        if (!isAudioFocused || mAudioFocusRequest == null) {
+        AudioFocusRequest request = mActiveAudioFocusRequest;
+        if (request == null) {
             return "";
         }
 
-        int abandonAudioFocusRes = audioManager.abandonAudioFocusRequest(mAudioFocusRequest);
+        int abandonAudioFocusRes = audioManager.abandonAudioFocusRequest(request);
         String abandonAudioFocusResStr;
         switch (abandonAudioFocusRes) {
             case AudioManager.AUDIOFOCUS_REQUEST_FAILED:
                 abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
                 break;
             case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                isAudioFocused = false;
                 abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
                 break;
             default:
@@ -747,14 +815,11 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
                 break;
         }
 
+        mActiveAudioFocusRequest = null;
         return abandonAudioFocusResStr;
     }
 
     private String abandonAudioFocusOld() {
-        if (!isAudioFocused) {
-            return "";
-        }
-
         int abandonAudioFocusRes = audioManager.abandonAudioFocus(this);
 
         String abandonAudioFocusResStr;
@@ -763,7 +828,6 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
                 abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_FAILED";
                 break;
             case AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
-                isAudioFocused = false;
                 abandonAudioFocusResStr = "AUDIOFOCUS_REQUEST_GRANTED";
                 break;
             default:
@@ -867,11 +931,13 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void setSpeakerphoneOn(final boolean enable) {
-        if (enable != audioManager.isSpeakerphoneOn())  {
-            Log.d(TAG, "setSpeakerphoneOn(): " + enable);
-	    audioManager.setMode(defaultAudioMode);
-            audioManager.setSpeakerphoneOn(enable);
-        }
+        runOnLifecycleThread(() -> {
+            if (enable != audioManager.isSpeakerphoneOn())  {
+                Log.d(TAG, "setSpeakerphoneOn(): " + enable);
+                audioManager.setMode(defaultAudioMode);
+                audioManager.setSpeakerphoneOn(enable);
+            }
+        });
     }
 
     // --- TODO (zxcpoiu): These two api name is really confusing. should be changed.
@@ -883,31 +949,35 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
      */
     @ReactMethod
     public void setForceSpeakerphoneOn(final int flag) {
-        if (flag < -1 || flag > 1) {
-            return;
-        }
-        Log.d(TAG, "setForceSpeakerphoneOn() flag: " + flag);
-        forceSpeakerOn = flag;
+        runOnLifecycleThread(() -> {
+            if (flag < -1 || flag > 1) {
+                return;
+            }
+            Log.d(TAG, "setForceSpeakerphoneOn() flag: " + flag);
+            forceSpeakerOn = flag;
 
-        // --- will call updateAudioDeviceState()
-        // --- Note: in some devices, it may not contains specified route thus will not be effected.
-        if (flag == 1) {
-            selectAudioDevice(AudioDevice.SPEAKER_PHONE);
-        } else if (flag == -1) {
-            selectAudioDevice(AudioDevice.EARPIECE); // --- use the most common earpiece to force `speaker off`
-        } else {
-            selectAudioDevice(AudioDevice.NONE); // --- NONE will follow default route, the default route of `video` call is speaker.
-        }
+            // --- will call updateAudioDeviceState()
+            // --- Note: in some devices, it may not contains specified route thus will not be effected.
+            if (flag == 1) {
+                selectAudioDevice(AudioDevice.SPEAKER_PHONE);
+            } else if (flag == -1) {
+                selectAudioDevice(AudioDevice.EARPIECE); // --- use the most common earpiece to force `speaker off`
+            } else {
+                selectAudioDevice(AudioDevice.NONE); // --- NONE will follow default route, the default route of `video` call is speaker.
+            }
+        });
     }
 
     // --- TODO (zxcpoiu): Implement api to let user choose audio devices
 
     @ReactMethod
     public void setMicrophoneMute(final boolean enable) {
-        if (enable != audioManager.isMicrophoneMute())  {
-            Log.d(TAG, "setMicrophoneMute(): " + enable);
-            audioManager.setMicrophoneMute(enable);
-        }
+        runOnLifecycleThread(() -> {
+            if (enable != audioManager.isMicrophoneMute())  {
+                Log.d(TAG, "setMicrophoneMute(): " + enable);
+                audioManager.setMicrophoneMute(enable);
+            }
+        });
     }
 
     /** 
@@ -916,6 +986,10 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
      */
     @ReactMethod
     public void startRingback(final String ringbackUriType) {
+        runOnLifecycleThread(() -> startRingbackOnLifecycleThread(ringbackUriType));
+    }
+
+    private void startRingbackOnLifecycleThread(String ringbackUriType) {
         if (ringbackUriType.isEmpty()) {
             return;
         }
@@ -928,7 +1002,7 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
                     return;
                 }
 
-                stopRingback(); // --- use brandnew instance
+                stopRingbackOnLifecycleThread(); // --- use brandnew instance
             }
 
             Uri ringbackUri;
@@ -938,7 +1012,9 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
             // --- use ToneGenerator instead file uri
             if (ringbackUriType.equals("_DTMF_")) {
                 mRingback = new myToneGenerator(myToneGenerator.RINGBACK);
-                mRingback.startPlay(data);
+                if (!mRingback.startPlay(data)) {
+                    mRingback = null;
+                }
                 return;
             }
 
@@ -960,18 +1036,26 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
             setMediaPlayerEvents((MediaPlayer)mRingback, "mRingback");
 
-            mRingback.startPlay(data);
+            if (!mRingback.startPlay(data)) {
+                mRingback = null;
+            }
         } catch(Exception e) {
             Log.d(TAG, "startRingback() failed", e);
+            stopRingbackOnLifecycleThread();
         }   
     }
 
     @ReactMethod
     public void stopRingback() {
+        runOnLifecycleThread(this::stopRingbackOnLifecycleThread);
+    }
+
+    private void stopRingbackOnLifecycleThread() {
         try {
             if (mRingback != null) {
-                mRingback.stopPlay();
+                MyPlayerInterface player = mRingback;
                 mRingback = null;
+                player.stopPlay();
             }
         } catch(Exception e) {
             Log.d(TAG, "stopRingback() failed");
@@ -985,6 +1069,14 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
      * otherwise, it will stop() after a tone completed.
      */
     public boolean startBusytone(final String busytoneUriType) {
+        if (Looper.myLooper() != ringtoneHandler.getLooper()) {
+            runOnLifecycleThread(() -> startBusytoneOnLifecycleThread(busytoneUriType));
+            return true;
+        }
+        return startBusytoneOnLifecycleThread(busytoneUriType);
+    }
+
+    private boolean startBusytoneOnLifecycleThread(String busytoneUriType) {
         if (busytoneUriType.isEmpty()) {
             return false;
         }
@@ -996,7 +1088,7 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
                     return false;
                 }
 
-                stopBusytone(); // --- use brandnew instance
+                stopBusytoneOnLifecycleThread(); // --- use brandnew instance
             }
 
             Uri busytoneUri;
@@ -1006,7 +1098,10 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
             // --- use ToneGenerator instead file uri
             if (busytoneUriType.equals("_DTMF_")) {
                 mBusytone = new myToneGenerator(myToneGenerator.BUSY);
-                mBusytone.startPlay(data);
+                if (!mBusytone.startPlay(data)) {
+                    mBusytone = null;
+                    return false;
+                }
                 return true;
             }
 
@@ -1026,19 +1121,28 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
             data.put("audioContentType", AudioAttributes.CONTENT_TYPE_SONIFICATION); // --- CONTENT_TYPE_MUSIC?
 
             setMediaPlayerEvents((MediaPlayer)mBusytone, "mBusytone");
-            mBusytone.startPlay(data);
+            if (!mBusytone.startPlay(data)) {
+                mBusytone = null;
+                return false;
+            }
             return true;
         } catch(Exception e) {
             Log.d(TAG, "startBusytone() failed", e);
+            stopBusytoneOnLifecycleThread();
             return false;
         }   
     }
 
     public void stopBusytone() {
+        runOnLifecycleThread(this::stopBusytoneOnLifecycleThread);
+    }
+
+    private void stopBusytoneOnLifecycleThread() {
         try {
             if (mBusytone != null) {
-                mBusytone.stopPlay();
+                MyPlayerInterface player = mBusytone;
                 mBusytone = null;
+                player.stopPlay();
             }
         } catch(Exception e) {
             Log.d(TAG, "stopBusytone() failed");
@@ -1047,112 +1151,269 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void startRingtone(final String ringtoneUriType, final int seconds) {
-        Thread thread = new Thread() {
-            @Override
-            public void run() {
-                try {
-                    Looper.prepare();
+        startRingtoneInternal(ringtoneUriType, seconds, null);
+    }
 
-                    Log.d(TAG, "startRingtone(): UriType=" + ringtoneUriType);
-                    if (mRingtone != null) {
-                        if (mRingtone.isPlaying()) {
-                            Log.d(TAG, "startRingtone(): is already playing");
-                            return;
-                        } else {
-                            stopRingtone(); // --- use brandnew instance
-                        }
+    @ReactMethod
+    public void startRingtoneWithVibration(final String ringtoneUriType, final int seconds,
+                                           @Nullable final ReadableArray pattern) {
+        long[] timings = null;
+        if (pattern != null && pattern.size() > 0) {
+            timings = new long[pattern.size()];
+            for (int i = 0; i < timings.length; i++) {
+                timings[i] = Math.max(0L, (long) pattern.getDouble(i));
+            }
+        }
+        startRingtoneInternal(ringtoneUriType, seconds, timings);
+    }
+
+    private void startRingtoneInternal(final String ringtoneUriType, final int seconds,
+                                       @Nullable final long[] vibrationPattern) {
+        runOnLifecycleThread(() -> {
+            final long generation = audioLifecycleState.beginRingtone();
+            if (generation < 0) {
+                Log.d(TAG, "startRingtone(): ringtone session is already active");
+                return;
+            }
+            if (!audioLifecycleState.isCurrentRingtone(generation)) {
+                return;
+            }
+            try {
+                Log.d(TAG, "startRingtone(): UriType=" + ringtoneUriType);
+
+                int ringerMode = audioManager.getRingerMode();
+                long vibrationDuration = vibrationPattern == null
+                        ? 0L : getVibrationDuration(vibrationPattern);
+                boolean vibrationAllowed = vibrationPattern != null
+                        && vibrationPattern.length > 0
+                        && vibrationDuration > 0L
+                        && hasPositiveVibrationPulse(vibrationPattern)
+                        && ringerMode != AudioManager.RINGER_MODE_SILENT
+                        && hasRingtoneVibrator();
+                Uri ringtoneUri = getRingtoneUri(ringtoneUriType);
+                boolean audible = ringerMode == AudioManager.RINGER_MODE_NORMAL
+                        && audioManager.getStreamVolume(AudioManager.STREAM_RING) > 0
+                        && ringtoneUri != null;
+                boolean hfpRinging = hasConnectedBluetoothHfp() && ringtoneUri != null;
+                if (!audible && !vibrationAllowed && !hfpRinging) {
+                    Log.d(TAG, "startRingtone(): no audible or vibration alert available");
+                    stopRingtoneOnLifecycleThread(generation);
+                    return;
+                }
+
+                boolean ringtoneNeedsFocus = audible || hfpRinging;
+                // Add the new owner before releasing call focus. The active call
+                // request remains registered until ringtone focus is requested.
+                if (ringtoneNeedsFocus) {
+                    audioLifecycleState.addRingtoneFocusOwner(generation);
+                }
+                if (audioManagerActivated) {
+                    stopOnLifecycleThread("");
+                }
+
+                boolean focusGranted = true;
+                if (ringtoneNeedsFocus) {
+                    String focusResult = requestFocusForCurrentOwners();
+                    focusGranted = "AUDIOFOCUS_REQUEST_GRANTED".equals(focusResult);
+                    if (!focusGranted) {
+                        Log.w(TAG, "startRingtone(): ringtone audio focus was not granted");
+                        audible = false;
                     }
+                }
 
-                    //if (!audioManager.isStreamMute(AudioManager.STREAM_RING)) {
-                    //if (origRingerMode == AudioManager.RINGER_MODE_NORMAL) {
-                    if (audioManager.getStreamVolume(AudioManager.STREAM_RING) == 0) {
-                        Log.d(TAG, "startRingtone(): ringer is silent. leave without play.");
-                        return;
-                    }
+                if (!audible && !vibrationAllowed && !focusGranted) {
+                    stopRingtoneOnLifecycleThread(generation);
+                    return;
+                }
 
-                    // --- there is no _DTMF_ option in startRingtone()
-                    Uri ringtoneUri = getRingtoneUri(ringtoneUriType);
-                    if (ringtoneUri == null) {
-                        Log.d(TAG, "startRingtone(): no available media");
-                        return;
-                    }
+                wakeLockUtils.acquirePartialWakeLock();
 
-                    if (audioManagerActivated) {
-                        InCallManagerModule.this.stop();
-                    }
+                boolean vibrationStarted = false;
+                if (vibrationAllowed) {
+                    vibrationStarted = startRingtoneVibration(vibrationPattern, generation);
+                }
 
-                    wakeLockUtils.acquirePartialWakeLock();
-
+                if (audible) {
                     storeOriginalAudioSetup();
-                    Map data = new HashMap<String, Object>();
-                    mRingtone = new myMediaPlayer();
+                    myMediaPlayer player = new myMediaPlayer();
+                    mRingtone = player;
+                    ringtonePlayerGeneration = generation;
 
+                    Map<String, Object> data = new HashMap<>();
                     data.put("name", "mRingtone");
                     data.put("sourceUri", ringtoneUri);
                     data.put("setLooping", true);
-
-                    //data.put("audioStream", AudioManager.STREAM_RING); // --- lagacy
-                    data.put("audioUsage", AudioAttributes.USAGE_NOTIFICATION_RINGTONE); // --- USAGE_NOTIFICATION_COMMUNICATION_REQUEST?
+                    data.put("audioUsage", AudioAttributes.USAGE_NOTIFICATION_RINGTONE);
                     data.put("audioContentType", AudioAttributes.CONTENT_TYPE_MUSIC);
-
-                    setMediaPlayerEvents((MediaPlayer) mRingtone, "mRingtone");
-
-                    mRingtone.startPlay(data);
-
-                    if (seconds > 0) {
-                        mRingtoneCountDownHandler = new Handler();
-                        mRingtoneCountDownHandler.postDelayed(new Runnable() {
-                            public void run() {
-                                try {
-                                    Log.d(TAG, String.format("mRingtoneCountDownHandler.stopRingtone() timeout after %d seconds", seconds));
-                                    stopRingtone();
-                                } catch(Exception e) {
-                                    Log.d(TAG, "mRingtoneCountDownHandler.stopRingtone() failed.");
-                                }
-                            }
-                        }, seconds * 1000);
+                    setRingtoneMediaPlayerEvents(player, generation);
+                    if (!player.startPlay(data)) {
+                        stopRingtoneOnLifecycleThread(generation);
+                        return;
                     }
-
-                    Looper.loop();
-                } catch(Exception e) {
-                    wakeLockUtils.releasePartialWakeLock();
-                    Log.e(TAG, "startRingtone() failed", e);
                 }
-            }
-        };
 
-        thread.start();
+                long timeoutMillis = seconds > 0 ? seconds * 1000L
+                        : (!audible && vibrationStarted ? vibrationDuration : -1L);
+                if (timeoutMillis > 0) {
+                    final long scheduledTimeoutMillis = timeoutMillis;
+                    ringtoneTimeout = () -> {
+                        if (audioLifecycleState.isCurrentRingtone(generation)) {
+                            Log.d(TAG, "startRingtone(): timeout after " + scheduledTimeoutMillis + " ms");
+                            stopRingtoneOnLifecycleThread(generation);
+                        }
+                    };
+                    ringtoneTimeoutGeneration = generation;
+                    ringtoneHandler.postDelayed(ringtoneTimeout, timeoutMillis);
+                } else if (!audible && !vibrationStarted && !hfpRinging) {
+                    stopRingtoneOnLifecycleThread(generation);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "startRingtone() failed", e);
+                stopRingtoneOnLifecycleThread(generation);
+            }
+        });
     }
 
     @ReactMethod
     public void stopRingtone() {
-        Thread thread = new Thread() {
-            @Override
-            public void run() {
-                try {
-                    if (mRingtone != null) {
-                        mRingtone.stopPlay();
-                        mRingtone = null;
-                        synchronized (audioSetupLock) {
-                            if (!audioManagerActivated) {
-                                restoreOriginalAudioSetup();
-                            } else {
-                                Log.d(TAG, "stopRingtone(): skip audio restore while call audio is active");
-                            }
-                        }
-                    }
-                    if (mRingtoneCountDownHandler != null) {
-                        mRingtoneCountDownHandler.removeCallbacksAndMessages(null);
-                        mRingtoneCountDownHandler = null;
-                    }
-                } catch (Exception e) {
-                    Log.d(TAG, "stopRingtone() failed");
-                }
-                wakeLockUtils.releasePartialWakeLock();
-            }
-        };
+        runOnLifecycleThread(() -> stopRingtoneOnLifecycleThread(
+                audioLifecycleState.currentRingtoneGeneration()));
+    }
 
-        thread.start();
+    private void stopRingtoneOnLifecycleThread(long generation) {
+        if (!audioLifecycleState.isCurrentRingtone(generation)) {
+            return;
+        }
+        audioLifecycleState.cancelRingtone(generation);
+        if (ringtoneTimeoutGeneration == generation && ringtoneTimeout != null) {
+            ringtoneHandler.removeCallbacks(ringtoneTimeout);
+            ringtoneTimeout = null;
+            ringtoneTimeoutGeneration = -1L;
+        }
+        if (ringtonePlayerGeneration == generation && mRingtone != null) {
+            MyPlayerInterface player = mRingtone;
+            mRingtone = null;
+            ringtonePlayerGeneration = -1L;
+            try {
+                player.stopPlay();
+            } catch (Exception e) {
+                Log.d(TAG, "stopRingtone() player release failed", e);
+            }
+        }
+        if (ringtoneVibratorGeneration == generation && ringtoneVibrator != null) {
+            Vibrator vibrator = ringtoneVibrator;
+            ringtoneVibrator = null;
+            ringtoneVibratorGeneration = -1L;
+            try {
+                vibrator.cancel();
+            } catch (Exception e) {
+                Log.d(TAG, "stopRingtone() vibration cancel failed", e);
+            }
+        }
+        releaseRingtoneAudioFocus(generation);
+        if (!audioManagerActivated && !audioLifecycleState.isRingtoneActive()) {
+            restoreOriginalAudioSetup();
+        }
+        updatePartialWakeLock();
+    }
+
+    private boolean hasRingtoneVibrator() {
+        Vibrator vibrator = (Vibrator) getReactApplicationContext().getSystemService(Context.VIBRATOR_SERVICE);
+        return vibrator != null && vibrator.hasVibrator();
+    }
+
+    private boolean startRingtoneVibration(long[] timings, long generation) {
+        Vibrator vibrator = (Vibrator) getReactApplicationContext().getSystemService(Context.VIBRATOR_SERVICE);
+        AudioAttributes attributes = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build();
+        ringtoneVibrator = vibrator;
+        ringtoneVibratorGeneration = generation;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createWaveform(timings, -1), attributes);
+            } else {
+                vibrator.vibrate(timings, -1, attributes);
+            }
+            return true;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to start ringtone vibration", e);
+            if (ringtoneVibratorGeneration == generation) {
+                ringtoneVibrator = null;
+                ringtoneVibratorGeneration = -1L;
+            }
+            return false;
+        }
+    }
+
+    private long getVibrationDuration(long[] timings) {
+        long duration = 0L;
+        for (long timing : timings) {
+            if (Long.MAX_VALUE - duration < timing) {
+                return Long.MAX_VALUE;
+            }
+            duration += timing;
+        }
+        return duration;
+    }
+
+    private boolean hasPositiveVibrationPulse(long[] timings) {
+        for (int i = 1; i < timings.length; i += 2) {
+            if (timings[i] > 0L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasConnectedBluetoothHfp() {
+        try {
+            for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (device.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                    return true;
+                }
+            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "Unable to inspect Bluetooth audio devices", e);
+        }
+        return false;
+    }
+
+    private void updatePartialWakeLock() {
+        if (audioLifecycleState.shouldHoldWakeLock()) {
+            wakeLockUtils.acquirePartialWakeLock();
+        } else {
+            wakeLockUtils.releasePartialWakeLock();
+        }
+    }
+
+    private void setRingtoneMediaPlayerEvents(MediaPlayer player, final long generation) {
+        player.setOnErrorListener((mp, what, extra) -> {
+            runOnLifecycleThread(() -> {
+                Log.d(TAG, "MediaPlayer mRingtone onError(). what: " + what + ", extra: " + extra);
+                stopRingtoneOnLifecycleThread(generation);
+            });
+            return true;
+        });
+        player.setOnPreparedListener(mp -> {
+            runOnLifecycleThread(() -> {
+                if (!audioLifecycleState.isCurrentRingtone(generation)
+                        || mp != mRingtone || ringtonePlayerGeneration != generation) {
+                    Log.d(TAG, "MediaPlayer mRingtone onPrepared(): stale session");
+                    mp.release();
+                    return;
+                }
+                try {
+                    audioManager.setMode(AudioManager.MODE_RINGTONE);
+                    updateAudioRoute();
+                    mp.start();
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "MediaPlayer mRingtone onPrepared() failed", e);
+                    stopRingtoneOnLifecycleThread(generation);
+                }
+            });
+        });
     }
 
     private void setMediaPlayerEvents(MediaPlayer mp, final String name) {
@@ -1161,9 +1422,10 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
             //http://developer.android.com/reference/android/media/MediaPlayer.OnErrorListener.html
             @Override
             public boolean onError(MediaPlayer mp, int what, int extra) {
-                Log.d(TAG, String.format("MediaPlayer %s onError(). what: %d, extra: %d", name, what, extra));
-                //return True if the method handled the error
-                //return False, or not having an OnErrorListener at all, will cause the OnCompletionListener to be called. Get news & tips 
+                runOnLifecycleThread(() -> {
+                    Log.d(TAG, String.format("MediaPlayer %s onError(). what: %d, extra: %d", name, what, extra));
+                    stopCurrentPlayerOnLifecycleThread(mp, name);
+                });
                 return true;
             }
         });
@@ -1182,30 +1444,60 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
             @Override
             public void onPrepared(MediaPlayer mp) {
-                Log.d(TAG, String.format("MediaPlayer %s onPrepared(), start play, isSpeakerPhoneOn %b", name, audioManager.isSpeakerphoneOn()));
-                if (name.equals("mBusytone")) {
-                    audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                } else if (name.equals("mRingback")) {
-                    audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                } else if (name.equals("mRingtone")) {
-                    audioManager.setMode(AudioManager.MODE_RINGTONE);
-                } 
-                updateAudioRoute();
-                mp.start();
+                runOnLifecycleThread(() -> {
+                    if (!isCurrentPlayer(mp, name)) {
+                        mp.release();
+                        return;
+                    }
+                    try {
+                        Log.d(TAG, String.format("MediaPlayer %s onPrepared(), start play, isSpeakerPhoneOn %b", name, audioManager.isSpeakerphoneOn()));
+                        audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                        updateAudioRoute();
+                        mp.start();
+                    } catch (RuntimeException e) {
+                        Log.e(TAG, "MediaPlayer " + name + " onPrepared() failed", e);
+                        stopCurrentPlayerOnLifecycleThread(mp, name);
+                    }
+                });
             }
         });
 
         mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
             @Override
             public void onCompletion(MediaPlayer mp) {
-                Log.d(TAG, String.format("MediaPlayer %s onCompletion()", name));
-                if (name.equals("mBusytone")) {
-                    Log.d(TAG, "MyMediaPlayer(): invoke stop()");
-                    stop();
-                }
+                runOnLifecycleThread(() -> {
+                    if (!isCurrentPlayer(mp, name)) {
+                        return;
+                    }
+                    Log.d(TAG, String.format("MediaPlayer %s onCompletion()", name));
+                    if (name.equals("mBusytone")) {
+                        stopOnLifecycleThread("");
+                    }
+                });
             }
         });
 
+    }
+
+    private boolean isCurrentPlayer(MediaPlayer player, String name) {
+        return (name.equals("mRingback") && player == mRingback)
+                || (name.equals("mBusytone") && player == mBusytone);
+    }
+
+    private void stopCurrentPlayerOnLifecycleThread(MediaPlayer player, String name) {
+        if (name.equals("mRingback") && player == mRingback) {
+            stopRingbackOnLifecycleThread();
+        } else if (name.equals("mBusytone") && player == mBusytone) {
+            // A busy tone is a deferred call stop. Failure must complete that
+            // teardown, while the identity check protects a replacement call.
+            stopOnLifecycleThread("");
+        } else {
+            try {
+                player.release();
+            } catch (RuntimeException e) {
+                Log.d(TAG, "Unable to release stale MediaPlayer " + name, e);
+            }
+        }
     }
 
 
@@ -1348,7 +1640,8 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
     private class myToneGenerator extends Thread implements MyPlayerInterface {
         private int toneType;
         private int toneCategory;
-        private boolean playing = false;
+        private volatile boolean playing = false;
+        private volatile boolean cancelled = false;
         private static final int maxWaitTimeMs = 3600000; // 1 hour fairly enough
         private static final int loadBufferWaitTimeMs = 20;
         private static final int toneVolume = 100; // The volume of the tone, given in percentage of maximum volume (from 0-100).
@@ -1372,10 +1665,12 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         }
 
         @Override
-        public void startPlay(final Map data) {
+        public boolean startPlay(final Map data) {
             String name = (String) data.get("name");
             caller = name;
+            cancelled = false;
             start();
+            return true;
         }
 
         @Override
@@ -1386,10 +1681,9 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         @Override
         public void stopPlay() {
             synchronized (this) {
-                if (playing) {
-                    notify();
-                }
+                cancelled = true;
                 playing = false;
+                notifyAll();
             }
         }
 
@@ -1449,37 +1743,85 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
                 tg = null;
             }
 
+            boolean completed = false;
             if (tg != null) {
-                synchronized (this) {
-                    if (!playing) {
-                        playing = true;
-
-                        // --- make sure audio routing, or it will be wired when switch suddenly
-                        if (caller.equals("mBusytone")) {
-                            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                        } else if (caller.equals("mRingback")) {
-                            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                        } else if (caller.equals("mRingtone")) {
-                            audioManager.setMode(AudioManager.MODE_RINGTONE);
-                        } 
-                        InCallManagerModule.this.updateAudioRoute();
-
-                        tg.startTone(toneType);
-                        try {
-                            wait(toneWaitTimeMs + loadBufferWaitTimeMs);
-                        } catch  (InterruptedException e) {
-                            Log.d(TAG, "myToneGenerator stopped. toneType: " + toneType);
+                final ToneGenerator toneGenerator = tg;
+                runOnLifecycleThread(() -> {
+                    boolean startFailed = false;
+                    synchronized (myToneGenerator.this) {
+                        boolean current = (caller.equals("mBusytone") && mBusytone == myToneGenerator.this)
+                                || (caller.equals("mRingback") && mRingback == myToneGenerator.this);
+                        if (!cancelled && current) {
+                            try {
+                                audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                                InCallManagerModule.this.updateAudioRoute();
+                                playing = toneGenerator.startTone(toneType);
+                                startFailed = !playing;
+                                if (startFailed) {
+                                    cancelled = true;
+                                }
+                            } catch (RuntimeException e) {
+                                Log.e(TAG, "myToneGenerator start failed", e);
+                                cancelled = true;
+                                startFailed = true;
+                            }
                         }
-                        tg.stopTone();
+                        myToneGenerator.this.notifyAll();
+                    }
+                    if (startFailed) {
+                        handleToneStartFailureOnLifecycleThread();
+                    }
+                });
+
+                synchronized (this) {
+                    try {
+                        while (!playing && !cancelled) {
+                            wait();
+                        }
+                        if (playing && !cancelled) {
+                            long waitMillis = toneWaitTimeMs + loadBufferWaitTimeMs;
+                            long deadline = SystemClock.elapsedRealtime() + waitMillis;
+                            while (!cancelled && waitMillis > 0) {
+                                wait(waitMillis);
+                                waitMillis = deadline - SystemClock.elapsedRealtime();
+                            }
+                            completed = !cancelled;
+                        }
+                    } catch (InterruptedException e) {
+                        cancelled = true;
+                        Thread.currentThread().interrupt();
                     }
                     playing = false;
-                    tg.release();
                 }
+                try {
+                    toneGenerator.stopTone();
+                } catch (RuntimeException e) {
+                    Log.d(TAG, "myToneGenerator stop failed", e);
+                }
+                try {
+                    toneGenerator.release();
+                } catch (RuntimeException e) {
+                    Log.d(TAG, "myToneGenerator release failed", e);
+                }
+            } else {
+                runOnLifecycleThread(this::handleToneStartFailureOnLifecycleThread);
             }
             Log.d(TAG, "MyToneGenerator(): play finished. caller=" + caller);
-            if (caller.equals("mBusytone")) {
-                Log.d(TAG, "MyToneGenerator(): invoke stop()");
-                InCallManagerModule.this.stop();
+            if (completed && caller.equals("mBusytone")) {
+                runOnLifecycleThread(() -> {
+                    if (mBusytone == this) {
+                        Log.d(TAG, "MyToneGenerator(): invoke stop()");
+                        stopOnLifecycleThread("");
+                    }
+                });
+            }
+        }
+
+        private void handleToneStartFailureOnLifecycleThread() {
+            if (caller.equals("mBusytone") && mBusytone == this) {
+                stopOnLifecycleThread("");
+            } else if (caller.equals("mRingback") && mRingback == this) {
+                stopRingbackOnLifecycleThread();
             }
         }
     }
@@ -1488,13 +1830,11 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
         @Override
         public void stopPlay() {
-            stop();
-            reset();
             release();
         }
 
         @Override
-        public void startPlay(final Map data) {
+        public boolean startPlay(final Map data) {
             try {
                 ReactContext reactContext = getReactApplicationContext();
 
@@ -1512,8 +1852,11 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
                 // -- will start at onPrepared() event
                 prepareAsync();
+                return true;
             } catch (Exception e) {
                 Log.d(TAG, "startPlay() failed", e);
+                release();
+                return false;
             }
         }
 
@@ -1526,18 +1869,20 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
 
     @ReactMethod
     public void chooseAudioRoute(String audioRoute, Promise promise) {
-        Log.d(TAG, "RNInCallManager.chooseAudioRoute(): user choose audioDevice = " + audioRoute);
+        runOnLifecycleThread(() -> {
+            Log.d(TAG, "RNInCallManager.chooseAudioRoute(): user choose audioDevice = " + audioRoute);
 
-        if (audioRoute.equals(AudioDevice.EARPIECE.name())) {
-            selectAudioDevice(AudioDevice.EARPIECE);
-        } else if (audioRoute.equals(AudioDevice.SPEAKER_PHONE.name())) {
-            selectAudioDevice(AudioDevice.SPEAKER_PHONE);
-        } else if (audioRoute.equals(AudioDevice.WIRED_HEADSET.name())) {
-            selectAudioDevice(AudioDevice.WIRED_HEADSET);
-        } else if (audioRoute.equals(AudioDevice.BLUETOOTH.name())) {
-            selectAudioDevice(AudioDevice.BLUETOOTH);
-        }
-        promise.resolve(getAudioDeviceStatusMap());
+            if (audioRoute.equals(AudioDevice.EARPIECE.name())) {
+                selectAudioDevice(AudioDevice.EARPIECE);
+            } else if (audioRoute.equals(AudioDevice.SPEAKER_PHONE.name())) {
+                selectAudioDevice(AudioDevice.SPEAKER_PHONE);
+            } else if (audioRoute.equals(AudioDevice.WIRED_HEADSET.name())) {
+                selectAudioDevice(AudioDevice.WIRED_HEADSET);
+            } else if (audioRoute.equals(AudioDevice.BLUETOOTH.name())) {
+                selectAudioDevice(AudioDevice.BLUETOOTH);
+            }
+            promise.resolve(getAudioDeviceStatusMap());
+        });
     }
 
     private static int getRandomInteger(int min, int max) {
@@ -1759,7 +2104,7 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
      * Updates list of possible audio devices and make new device selection.
      */
     public void updateAudioDeviceState() {
-        UiThreadUtil.runOnUiThread(() -> {
+        runOnLifecycleThread(() -> {
             Log.d(TAG, "--- updateAudioDeviceState: "
                             + "wired headset=" + hasWiredHeadset + ", "
                             + "BT state=" + bluetoothManager.getState());

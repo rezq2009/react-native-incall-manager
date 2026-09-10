@@ -80,19 +80,30 @@ class InCallManager {
         seconds = (typeof seconds === 'number' && seconds > 0) ? parseInt(seconds) : -1; // --- android only, default looping
 
         if (Platform.OS === 'android') {
-            _InCallManager.startRingtone(ringtone, seconds);
+            if (typeof _InCallManager.startRingtoneWithVibration === 'function') {
+                _InCallManager.startRingtoneWithVibration(
+                    ringtone,
+                    seconds,
+                    this.vibrate ? vibrate_pattern : null
+                );
+            } else {
+                _InCallManager.startRingtone(ringtone, seconds);
+                if (this.vibrate) {
+                    Vibration.vibrate(vibrate_pattern, false);
+                }
+            }
         } else {
             _InCallManager.startRingtone(ringtone, ios_category);
-        }
-
-        // --- should not use repeat, it may cause infinite loop in some cases.
-        if (this.vibrate) {
-            Vibration.vibrate(vibrate_pattern, false); // --- ios needs RN 0.34 to support vibration pattern
+            if (this.vibrate) {
+                // --- should not use repeat, it may cause infinite loop in some cases.
+                Vibration.vibrate(vibrate_pattern, false); // --- ios needs RN 0.34 to support vibration pattern
+            }
         }
     }
 
     stopRingtone() {
-        if (this.vibrate) {
+        if (this.vibrate && (Platform.OS !== 'android'
+                || typeof _InCallManager.startRingtoneWithVibration !== 'function')) {
             Vibration.cancel();
         }
         _InCallManager.stopRingtone();
