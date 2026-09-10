@@ -934,7 +934,10 @@ public class InCallManagerModule extends ReactContextBaseJavaModule implements L
         runOnLifecycleThread(() -> {
             if (enable != audioManager.isSpeakerphoneOn())  {
                 Log.d(TAG, "setSpeakerphoneOn(): " + enable);
-                audioManager.setMode(defaultAudioMode);
+                // Route changes must not turn a standalone ringtone into a call.
+                boolean ringing = audioLifecycleState.isRingtoneActive()
+                        && !audioLifecycleState.isCallActive() && mRingtone != null;
+                audioManager.setMode(ringing ? AudioManager.MODE_RINGTONE : defaultAudioMode);
                 audioManager.setSpeakerphoneOn(enable);
             }
         });
