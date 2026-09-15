@@ -193,6 +193,21 @@ InCallManager.stop();
 
 ```
 
+On Android, an audible incoming ringtone requests transient audio focus with
+ringtone audio attributes. A vibration-only ringtone does not request focus
+unless a Bluetooth HFP output is connected. Ringtone timeout and cleanup only
+release focus acquired for that ringtone; they do not release focus retained
+by an active call or an explicit `requestAudioFocus()` call. Ringtone vibration
+uses ringtone audio attributes and is cancelled by `stopRingtone()`.
+When call or explicitly requested focus overlaps a ringtone, call audio
+attributes take priority. Each `requestAudioFocus()` and `start()` call makes a
+fresh Android focus request, including after a focus-loss callback. An explicit
+`abandonAudioFocus()` remains a global request to release this module's current
+Android audio focus; ringtone and call cleanup do not implicitly reacquire it.
+Pair each explicit `requestAudioFocus()` with `abandonAudioFocus()`. `stop()`
+and `stopRingtone()` release only their own lifecycle interest, so a retained
+explicit request continues to hold focus until it is explicitly abandoned.
+
 Also can interact with events if you want:
 See API section.
 
